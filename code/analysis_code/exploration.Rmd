@@ -3,9 +3,185 @@ title: "Exploratory data analysis"
 author: "Zane Billings"
 date: "2021-10-11"
 output: html_document
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+First, load any packages which are necessary for analysis. And then load the dataset.
+
+```{r pkgs-dat}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggbeeswarm)
+library(gghalves)
+library(here)
+
+dat <- readRDS(here::here("data/processed_data/processeddata.rds"))
+```
+
+The main outcomes we will consider for this analysis are **body temperature** (continuous) and **nausea** (categorical). Since there are 30 other potential predictors, we need to decide which predictors to explore. Instead of doing any sort of data-driven method for this since, I will just pick some:
+* **cough** (presence/absence);
+* **weakness** (presence/absence);
+* **myalgia** (presence/absence);
+* **chills or sweats** (presence/absence); and
+* **subjective fever** (presence/absence.
+
+```{r}
+dat_eda <- dat |>
+  dplyr::select(BodyTemp, Nausea, CoughYN, WeaknessYN, MyalgiaYN, ChillsSweats,
+         SubjectiveFever)
+```
+
+
+I think five predictors is a pretty good number and there is no real reason why I chose these ones, other than the first four are the ones I see the most in the literature, and I think comparing subjective fever to body temperature will be interesting.
+
+# Univariate distributions
+
+First we will look at the distribution of the only continuous variable, body temperature.
+
+```{r BodyTempSS}
+# Define a few functions so that making the summary stats I want will be easier
+# The first function returns the quantiles as a tibble
+get_quantiles <- function(.x, p = c(0, 0.25, 0.5, 0.75, 1)) {
+  q <- quantile(.x, probs = p)
+  tibble(x = q, probs = p * 100) |>
+    pivot_wider(names_from = probs, values_from = x,
+                names_glue = "p{probs}")
+}
+# The second function returns the mean and bootstrap CI (b = 1000, alpha = .05)
+# as a tibble
+get_boot_ci <- function(.x, d = 2) {
+  ggplot2::mean_cl_boot(.x) |>
+    dplyr::transmute(
+      mean = round(y, d),
+      "95% CI" = paste0("(", round(ymin, d), ",", round(ymax, d), ")")
+    )
+}
+
+# Now generate the summary stats and print as an HTML table
+dat |>
+  dplyr::summarize(
+    get_boot_ci(BodyTemp),
+    "std. dev" = round(sd(BodyTemp), 2),
+    "std. err" = round(sd(BodyTemp) / sqrt(n()), 2),
+    get_quantiles(BodyTemp)
+  ) |>
+  knitr::kable()
+```
+
+From the summary statistics, we can see that while the median is fairly close to the mean (within one standard deviation), the third quartile (75th percentile) and the maximum both lie outside of the 95% confidence interval--which in this case should be fairly robust as it was computed with 1000 bootstrap resamples. This suggests that while the bulk of the data are close together, there are some data points which are much larger than the majority. These could be outliers, or the data could be skewed to the right. We could calculate more summary statistics to try and figure this out, but I think we will have more luck making a plot.
+
+```{r BodyTempPlot}
+ggplot(dat, aes(x = BodyTemp)) +
+  geom_histogram(
+    binwidth = 0.1,
+    color = "black",
+    fill = "gray",
+    boundary = 0.5
+  ) +
+  cowplot::theme_cowplot() +
+  scale_y_continuous(expand = expansion(add = c(0, 1))) +
+  scale_x_continuous(name = "body temperature (degrees F)")
+```
+
+From the histogram, we can see that the data are mostly concentrated around the range given by the CI in the previous table (in fact, this is what the CI means). However, there are a few outliers which are above this, so the data is skewed, but there are not enough large temperature values to dramatically skew the mean of the data. We could consider transforming the data to correct for the skew (e.g. the Box-Cox transformation may help), but this makes the interpretation more annoying so I will not do that.
+
+Next let's look at the distribution of the binary variables.
+
+```{r, BinVarBarPlot}
+dat_eda |>
+  dplyr::select(-BodyTemp) |>
+  tidyr::pivot_longer(
+    cols = everything()
+  ) |>
+  ggplot(aes(x = value)) +
+  geom_hline(yintercept = nrow(dat_eda) / 2, lty = 2) +
+  geom_bar(color = "black", fill = "gray") +
+  facet_wrap(vars(name)) +
+  scale_x_discrete(name = NULL) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  cowplot::theme_cowplot()
+```
+
+We can also create this information in table form. For the table I would prefer to have the percentages instead of the counts, but I was too lazy to do this in the plot above.
+
+```{r}
+dat_eda |>
+  dplyr::select(-BodyTemp) |>
+  tidyr::pivot_longer(cols = everything(), names_to = "var") |>
+  dplyr::group_by(var) |>
+  dplyr::summarize(
+    "# positive" = sum(value == "Yes"),
+    p = round(mean(value == "Yes"), 2),
+    "95% CI" = paste0(
+      "(", round(p - 1.96 * sqrt((p * (1-p)) / 730), 2), ",",
+      round(p + 1.96 * sqrt((p * (1-p)) / 730), 2), ")")
+    ) |>
+  knitr::kable()
+```
+
+# Bivariate associations
+
+Now we can examine the relationships between our predictors and our outcomes. First we will consider body temperature as the main outcome.
+
+```{r}
+dat_eda |>
+  tidyr::pivot_longer(
+    cols = !BodyTemp
+  ) |>
+  ggplot(aes(x = value, y = BodyTemp)) +
+  geom_jitter(shape = 21, alpha = 0.5) +
+  geom_half_violin(side = "r", color = "red", fill = NA) +
+  geom_half_boxplot(outlier.shape = NA, color = "red", fill = NA) +
+  stat_summary(shape = 9, fun = mean, size = 0.5, color = "red") +
+  facet_wrap(~name) +
+  cowplot::theme_cowplot()
+```
+
+I could probably spend some more time fiddling with this plot to make it look nicer but I am not going to, I think it is about 80% to where I want it to be. Anyways, this plot shows the data points, the boxplot, the violin plot density estimate, and the diamond crosshair marks the mean.
+
+Now we can visualize the relationship between the different variables and the presence of absence of nausea. For this, I will make a separate plot for the categorical predictors and the numerical predictor. First let's look at the relationship between nausea and body temperature.
+
+```{r}
+dat_eda |>
+  dplyr::transmute(
+    BodyTemp,
+    Nausea = if_else(Nausea == "Yes", 1, 0)
+  ) |>
+  ggplot(aes(x = BodyTemp, y = Nausea)) +
+  geom_count(shape = 1) +
+  geom_smooth(formula = "y ~ x", method = "glm",
+              method.args = list(family = "binomial")) +
+  cowplot::theme_cowplot() +
+  scale_x_continuous(name = "body temperature (degrees F)") +
+  scale_y_continuous(name = "probability of nausea")
+```
+
+For this plot, presence of nausea is represented by "1" and absence of nausea is represented by "0". The size of the circle represents the weight of that point (the number of patients which had the same body temperature and nausea status). This allows us to fit a GLM that predicts the probability a patient has nausea based on their body temperature. As you can see from the plot, body temperature has very little predictive power for nausea status.
+
+Now we can see which of the categorical variables are predictive for nausea status. The only real visualization option we have here is a bar chart, but we can choose if we want it to be stacked or clustered.
+
+```{r}
+dat_eda |>
+  dplyr::select(-BodyTemp) |>
+  tidyr::pivot_longer(cols = -Nausea) |>
+  ggplot(aes(x = value, fill = Nausea)) +
+  geom_bar(position = "fill") +
+  facet_wrap(vars(name)) +
+  scale_x_discrete(name = NULL) +
+  scale_y_continuous(labels = scales::percent_format(), name = NULL) +
+  scale_fill_manual(values = c("purple", "gold")) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "bottom", legend.justification = "center")
+```
+
+Based on this chart, there aren't any extremely strong predictors of nausea from the set of predictors that I chose, but it looks like cough is not really predictive at all. Out of these, maybe myalgia and weakness are the strongest predictors, but even those are only moderately predictive. However, it may be the case that these symptoms actually interact, so these bivariate associations may not capture all available information.
+
+There is no missing data, so we do not need to deal with that. If I have any other good ideas for exploring these data, I will add them here later.
