@@ -8,14 +8,42 @@
 
 # Load needed packages
 library(dplyr) # for data processing
+library(tidyr) # for data processing
 library(here) # to set paths
 
+###############################
+# Importing data
+###############################
+
 # path to data
-data_location <- here::here("data","raw_data","exampledata.xlsx")
+data_location <- here::here("data","raw_data","SympAct_Any_Pos.Rda")
 
 # load data.
-rawdata <- readxl::read_excel(data_location)
+rawdata <- readRDS(data_location)
 
+###############################
+# Data processing
+###############################
+
+processeddata <- rawdata |>
+  # Remove all variables with Score, Total, FluA, FluB, Dxname, or Activity
+  # as part of the name
+  dplyr::select(
+    -contains("Score"),
+    -contains("Total"),
+    -contains("FluA"),
+    -contains("FluB"),
+    -contains("Dxname"),
+    -contains("Activity"),
+    # Also remove Unique.Visit
+    -Unique.Visit
+  ) |>
+  # Remove all NA observations
+  tidyr::drop_na()
+
+###############################
+# Saving data to file
+###############################
 
 # location to save file
 save_data_location <- here::here("data","processed_data","processeddata.rds")
