@@ -50,21 +50,41 @@ temp_mod_tbl <- reg_tab(
   c("Runny nose only", "All predictors")
 )
 
+# Model difference analysis of deviance
+temp_mod_aov <-
+  anova(temp_mod_simple$fit, temp_mod_all$fit, test = "Chisq")
+
 ####
 
 ###
 # Binomial models: Nausea is the outcome of interest
+logistic_mod <- logistic_reg() |>
+  set_mode("classification") |>
+  set_engine("glm")
+
 # Model 1: RunnyNose only
+nausea_mod_simple <- logistic_mod |>
+  fit(Nausea ~ RunnyNose, data = mydata)
 
 # Model 2: all predictors
+nausea_mod_all <- logistic_mod |>
+  fit(Nausea ~ ., data = mydata)
+
+# Result reports
+nausea_mod_tbl <- reg_tab(
+  list(nausea_mod_simple, nausea_mod_all),
+  c("Runny nose only", "All predictors")
+)
+
+# Model difference analysis of deviance
+nausea_mod_aov <-
+  anova(nausea_mod_simple$fit, nausea_mod_all$fit, test = "Chisq")
 
 ####
 
-#look at fit results
-print(lmtable)
-
-# save fit results table  
-table_file = here("results", "resulttable.rds")
-saveRDS(lmtable, file = table_file)
-
+# save results tables
+saveRDS(temp_mod_tbl, file = here::here("results", "temp_mod_tbl.Rds"))
+saveRDS(temp_mod_aov, file = here::here("results", "temp_mod_aov.Rds"))
+saveRDS(nausea_mod_tbl, file = here::here("results", "nausea_mod_tbl.Rds"))
+saveRDS(nausea_mod_aov, file = here::here("results", "nausea_mod_aov.Rds"))
   
