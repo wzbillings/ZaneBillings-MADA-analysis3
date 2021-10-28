@@ -462,3 +462,148 @@ Well, the LASSO model is a bit better than the tree model, but not really. It lo
 Either way, let's go ahead and fit the random forest model and see if that is any better.
 
 ## Random forest model
+
+Again we will set up the workflow first.
+
+```{r RFWF}
+rf_wf <- workflow() |>
+  add_model(rf_spec) |>
+  add_recipe(bt_rec_pol)
+```
+
+For the random forest we can probably use the same tuning routine as we did for the decision tree, but I'll increase the size of the grid of parameters to search.
+
+```{r RFTuning, cache = TRUE}
+# Register a parallel backend so this doesn't take all day
+doParallel::registerDoParallel()
+
+# Define a grid of potential parameter values. I again allowed dials to choose
+# the range of parameters to search for the penalty parameter.
+rf_parms <- rf_spec |>
+  dials::parameters() |>
+  dials::finalize(train |> select(-BodyTemp))
+
+rf_grid <- rf_parms
+  grid_latin_hypercube(size = 1000)
+
+# Grid search for parameter values
+rf_grid_res <- rf_wf |>
+  tune_grid(
+    resamples = resamples,
+    metrics = bt_met,
+    control = control_grid(verbose = TRUE),
+    grid = rf_grid,
+    param_info = rf_parms
+  )
+
+# Use the grid search to initialize simulated annealing.
+rf_sa <- rf_wf %>%
+  tune_sim_anneal(
+    resamples = resamples,
+    metrics = bt_met,
+    control = control_sim_anneal(verbose = TRUE),
+    iter = 100,
+    param_info = rf_parms
+  )
+
+# Turn off the parallel cluster--it gets weird if you don't!
+doParallel::stopImplicitCluster()
+
+# Select best parameter values after optimization
+best_rf_sa <- select_best(rf_sa)
+
+# Finalize workflow with best values
+final_rf_wf <- rf_wf |>
+  finalize_workflow(best_rf_sa)
+
+# Fit model to training data
+rf_train_fit <- final_rf_wf |> fit(data = train)
+```
+
+We can't plot the actual model here, but we can make the trace plot for the coefficients, so let's do that.
+
+```{r LassoTracePlots}
+# Extract glmnet object from workflow
+x <- lasso_train_fit$fit$fit$fit
+
+# Plot trace plot
+png(filename = here::here("results", "figures", "lasso_trace.png"))
+plot(x, "lambda")
+dev.off()
+knitr::include_graphics(here::here("results", "figures", "lasso_trace.png"))
+```
+
+This is exactly what we should expect--as the penalty increase, more terms drop out of the model. There is nothing really unusual or noteworthy here.
+
+Next, let's plot the diagnostic plots (same as before) for the LASSO model.
+
+```{r LassoDiagnosticPlots}
+# Get predictions and residuals
+lasso_res <- lasso_train_fit |>
+  augment(new_data = train) |>
+  dplyr::select(.pred, BodyTemp) |>
+  dplyr::mutate(.resid = BodyTemp - .pred)
+
+# Plot Predictions vs observed values
+lasso_pred_obs_plot <- ggplot(lasso_res, aes(x = BodyTemp, y = .pred)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: predicted vs observed",
+    x = "Observed",
+    y = "Fitted"
+  )
+
+# Plot model predictions vs residuals
+lasso_pred_res_plot <- ggplot(lasso_res, aes(y = .resid, x = .pred)) +
+  geom_hline(yintercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: residuals vs fitted",
+    y = "Residuals",
+    x = "Fitted"
+  )
+
+# Print both plots together
+lasso_diag <- cowplot::plot_grid(
+  lasso_pred_obs_plot, lasso_pred_res_plot, ncol = 1
+)
+lasso_diag
+ggsave(filename = here::here("results", "figures", "lasso_diagnostics.png"),
+       plot = lasso_diag,
+       width = 11, height = 8.5)
+```
+
+Well, the LASSO model appears to be performing better than the decision tree at least. But there are some noticeable problems. From the plot of predicted vs observed values, we can see that LASSO is not predicting some of the most extreme values at well, which is problematic and will definitely hurt the prediction accuracy. The residual plot also suggests that the LASSO model is biased towards lower values. It could also indicate heteroscedasticity of the residuals, but we don't need to worry about that right now.
+
+Let's example the best penalty values and see what the RMSEs look like.
+
+```{r BestLASSO}
+lasso_sa |>
+  show_best(n = 10)  |>
+  dplyr::select(rmse = mean, std_err, penalty) |>
+  dplyr::mutate(
+    rmse = round(rmse, 2),
+    std_err = round(std_err, 4),
+    `log penalty` = round(log(penalty), 2),
+    .keep = "unused"
+  ) |>
+  knitr::kable(caption = "Best performing hyperparameter sets")
+```
+
+Now we can compare the performance of the LASSO model we selected as the best with the null model (and the tree model).
+
+```{r LassoRMSE}
+lasso_RMSE <- lasso_sa |>
+  show_best(n = 1) |>
+  dplyr::transmute(
+    rmse = round(mean, 2),
+    SE = round(std_err, 4),
+    model = "LASSO"
+  ) |>
+  dplyr::bind_rows(tree_RMSE)
+lasso_RMSE |>
+  knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
+```
