@@ -133,7 +133,7 @@ rf_spec <-
     min_n = tune(),
     trees = tune()
   ) |>
-  set_engine("ranger", num.threads = 8) |>
+  set_engine("ranger", num.threads = 8, importance = "permutation") |>
   set_mode("regression")
 ```
 
@@ -454,7 +454,7 @@ lasso_RMSE <- lasso_sa |>
   ) |>
   dplyr::bind_rows(tree_RMSE)
 lasso_RMSE |>
-  knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
+  knitr::kable(caption = "Comparison of RMSE values for the LASSO, regression tree, and null models.")
 ```
 
 Well, the LASSO model is a bit better than the tree model, but not really. It looks like the tree model only guessing four different values didn't perform a lot better than LASSO. This might indicate that our predictors are not very strongly associated with the outcome.
@@ -471,38 +471,33 @@ rf_wf <- workflow() |>
   add_recipe(bt_rec_pol)
 ```
 
-For the random forest we can probably use the same tuning routine as we did for the decision tree, but I'll increase the size of the grid of parameters to search.
+For the random forest, I'll skip the initial grid search and just let the simulated annealing algorithm run a bit longer than before.
 
 ```{r RFTuning, cache = TRUE}
 # Register a parallel backend so this doesn't take all day
-doParallel::registerDoParallel()
+doParallel::registerDoParallel(cores = 16)
 
-# Define a grid of potential parameter values. I again allowed dials to choose
-# the range of parameters to search for the penalty parameter.
+# Since the potential values of mtry depend on the data, we need to finalize
+# the parameters before optimizing.
 rf_parms <- rf_spec |>
   dials::parameters() |>
   dials::finalize(train |> select(-BodyTemp))
 
-rf_grid <- rf_parms
-  grid_latin_hypercube(size = 1000)
-
-# Grid search for parameter values
-rf_grid_res <- rf_wf |>
-  tune_grid(
-    resamples = resamples,
-    metrics = bt_met,
-    control = control_grid(verbose = TRUE),
-    grid = rf_grid,
-    param_info = rf_parms
-  )
-
-# Use the grid search to initialize simulated annealing.
+# Simulated annealing for parameter optimization. The simulated annealing
+# algorithm will run for a max of 250 iterations, but stop if it does not
+# improve in 10 consecutive runs. I've also lowered the cooling coefficient
+# a bit and increased the neighborhood to search.
 rf_sa <- rf_wf %>%
   tune_sim_anneal(
     resamples = resamples,
     metrics = bt_met,
-    control = control_sim_anneal(verbose = TRUE),
-    iter = 100,
+    control = control_sim_anneal(
+      verbose = TRUE,
+      no_improve = 10,
+      radius = c(0.01, 0.25),
+      cooling_coef = 0.01
+    ),
+    iter = 250,
     param_info = rf_parms
   )
 
@@ -520,90 +515,96 @@ final_rf_wf <- rf_wf |>
 rf_train_fit <- final_rf_wf |> fit(data = train)
 ```
 
-We can't plot the actual model here, but we can make the trace plot for the coefficients, so let's do that.
+We can't plot the actual model here, because there are actually very many models. The `ranger` engine has an implementation for variable importance though, so let's plot that.
 
-```{r LassoTracePlots}
-# Extract glmnet object from workflow
-x <- lasso_train_fit$fit$fit$fit
-
-# Plot trace plot
-png(filename = here::here("results", "figures", "lasso_trace.png"))
-plot(x, "lambda")
-dev.off()
-knitr::include_graphics(here::here("results", "figures", "lasso_trace.png"))
+```{r RFImportance}
+rf_train_fit$fit$fit$fit |>
+  ranger::importance() |>
+  tibble::enframe() |>
+  dplyr::slice_max(value, n = 10) |>
+  ggplot(aes(x = value, y = forcats::fct_reorder(name, value))) +
+  geom_col(color = "black", fill = "darkorchid4") +
+  labs(x = "RF variable importance (permutation method)", y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+  cowplot::theme_cowplot()
 ```
 
-This is exactly what we should expect--as the penalty increase, more terms drop out of the model. There is nothing really unusual or noteworthy here.
+Interestingly, from this plot we can see that the most predictive variable in the random forest model was Subjective Fever--it makes sense to me that patients believing they have a fever is actually somewhat predictive of body temperature. I also think it is interesting that the cubic terms and linear terms for both Myalgia and Weakness appear to be important.
 
-Next, let's plot the diagnostic plots (same as before) for the LASSO model.
+Next, let's plot the diagnostic plots (same as before) for the random forest model.
 
-```{r LassoDiagnosticPlots}
+```{r RFDiagnosticPlots}
 # Get predictions and residuals
-lasso_res <- lasso_train_fit |>
+rf_res <- rf_train_fit |>
   augment(new_data = train) |>
   dplyr::select(.pred, BodyTemp) |>
   dplyr::mutate(.resid = BodyTemp - .pred)
 
 # Plot Predictions vs observed values
-lasso_pred_obs_plot <- ggplot(lasso_res, aes(x = BodyTemp, y = .pred)) +
+rf_pred_obs_plot <- ggplot(rf_res, aes(x = BodyTemp, y = .pred)) +
   geom_abline(slope = 1, intercept = 0, color = "red", lty = 2) +
   geom_point() +
   cowplot::theme_cowplot() +
   labs(
-    title = "LASSO: predicted vs observed",
+    title = "Random forest: predicted vs observed",
     x = "Observed",
     y = "Fitted"
   )
 
 # Plot model predictions vs residuals
-lasso_pred_res_plot <- ggplot(lasso_res, aes(y = .resid, x = .pred)) +
+rf_pred_res_plot <- ggplot(rf_res, aes(y = .resid, x = .pred)) +
   geom_hline(yintercept = 0, color = "red", lty = 2) +
   geom_point() +
   cowplot::theme_cowplot() +
   labs(
-    title = "LASSO: residuals vs fitted",
+    title = "Random forest: residuals vs fitted",
     y = "Residuals",
     x = "Fitted"
   )
 
 # Print both plots together
-lasso_diag <- cowplot::plot_grid(
-  lasso_pred_obs_plot, lasso_pred_res_plot, ncol = 1
+rf_diag <- cowplot::plot_grid(
+  rf_pred_obs_plot, rf_pred_res_plot, ncol = 1
 )
-lasso_diag
-ggsave(filename = here::here("results", "figures", "lasso_diagnostics.png"),
-       plot = lasso_diag,
+rf_diag
+ggsave(filename = here::here("results", "figures", "rf_diagnostics.png"),
+       plot = rf_diag,
        width = 11, height = 8.5)
 ```
 
-Well, the LASSO model appears to be performing better than the decision tree at least. But there are some noticeable problems. From the plot of predicted vs observed values, we can see that LASSO is not predicting some of the most extreme values at well, which is problematic and will definitely hurt the prediction accuracy. The residual plot also suggests that the LASSO model is biased towards lower values. It could also indicate heteroscedasticity of the residuals, but we don't need to worry about that right now.
+The random forest appears to suffer from similar issues to the LASSO model: we are having a lot of trouble predicting large values of body temperature. I don't have anything else to really say about that.
 
-Let's example the best penalty values and see what the RMSEs look like.
+Let's look at the best parameter combinations.
 
-```{r BestLASSO}
-lasso_sa |>
+```{r BestRF}
+rf_sa |>
   show_best(n = 10)  |>
-  dplyr::select(rmse = mean, std_err, penalty) |>
+  dplyr::select(rmse = mean, std_err, mtry, trees, min_n) |>
   dplyr::mutate(
     rmse = round(rmse, 2),
     std_err = round(std_err, 4),
-    `log penalty` = round(log(penalty), 2),
     .keep = "unused"
   ) |>
   knitr::kable(caption = "Best performing hyperparameter sets")
 ```
 
-Now we can compare the performance of the LASSO model we selected as the best with the null model (and the tree model).
+Now we can compare the performance of the RF model we selected as the best with the LASSO, single tree, and null models.
 
-```{r LassoRMSE}
-lasso_RMSE <- lasso_sa |>
+```{r RFRMSE}
+rf_RMSE <- rf_sa |>
   show_best(n = 1) |>
   dplyr::transmute(
     rmse = round(mean, 2),
     SE = round(std_err, 4),
-    model = "LASSO"
+    model = "RF"
   ) |>
-  dplyr::bind_rows(tree_RMSE)
-lasso_RMSE |>
+  dplyr::bind_rows(lasso_RMSE)
+rf_RMSE |>
   knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
 ```
+
+# Model selection and evaluation
+
+For the final step of this analysis, we need to choose one of the models. {EXPLAIN HERE}
+
+Now I will fit this model on the testing set to evaluate the out-of-sample performance.
