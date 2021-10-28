@@ -1,3 +1,15 @@
+---
+title: "Basic ML Models"
+author: "Zane Billings"
+date: "10/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
 ###############################
 # Basic ML models
 # Zane Billings
@@ -195,7 +207,7 @@ tree_pred_res_plot <- ggplot(tree_pol_res, aes(x = .resid, y = .pred)) +
   )
 
 # Get best outcomes
-tree_best_preds <- show_best()
+tree
 
 # Compare to null model RMSE
 
@@ -227,4 +239,7 @@ cowplot::plot_grid(
 #   grid = tree_grid,
 #   control = control_grid(verbose = TRUE)
 # )
+
+
+```
 
