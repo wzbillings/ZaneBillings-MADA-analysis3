@@ -1,41 +1,46 @@
 ---
-title: "Basic ML Models"
+title: "Basic ML Models 1"
 author: "Zane Billings"
 date: "10/28/2021"
 output: html_document
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r}
-###############################
-# Basic ML models
-# Zane Billings
-# In this script, I will preprocess the data, and fit a few basic ML models.
-# The main outcome here will be Body Temperature, and the models I will fit are:
-# 1. Regression tree
-# 2. LASSO
-# 3. Random forest
-###############################
+# Setup
 
-# Packages and setup
-library(here)
-library(tidymodels)
-library(finetune)
-library(doParallel)
+In this section of the analysis, I will go through some more data preprocessing, and fit a few basic ML models. The goal is to predict body temperature based on symptom data. The models I will fit in this analysis are:
+1. Regression tree;
+2. LASSO regression; and
+3. Random forest.
+
+First we will load necessary packages (due to past trauma I always load all packages at the beginning of the analysis), and import the clean data.
+
+```{r PkgsData}
+# Packages
+library(here) # For file paths
+library(tidymodels) # For model fitting
+library(finetune) # For model tuning algorithms
+library(doParallel) # Parallel backend for tuning
+library(cowplot)
+library(scales)
+library(rpart)
+library(glmnet)
+library(ranger)
 
 # Load the data
 dat_orig <- readRDS(here::here("data", "processed_data", "processeddata.rds"))
+```
 
-###############################
-# Data preprocessing
-###############################
-# In the previous analysis, we had an issue with rank deficient linear models.
-# This was due to having variables for presence/absence AND symptom severity
-# for Weakness, Cough, and Myalgia. So we will remove the binary versions.
-# We will also ensure that the intensity variables are coded as ordinal vars.
+# Data Preprocessing
+
+In the previous analysis, we had an issue with rank deficient linear models. This was due to having variables for presence/absence AND symptom severity for Weakness, Cough, and Myalgia. So we will remove the binary versions. We will also ensure that the intensity variables are coded as ordinal vars. Finally, we will remove any binary symptom variables that have less than 50 events, as these variables have a variance close to zero and are unlikely to be predictive.
+
+```{r DataPreprocessing}
 dat <- dat_orig |>
   # Remove the unwanted variables
   dplyr::select(-c(CoughYN, CoughYN2, MyalgiaYN, WeaknessYN)) |>
@@ -43,17 +48,14 @@ dat <- dat_orig |>
   dplyr::rename(Cough = CoughIntensity) |>
   # Code symptom intensities as ordered factors
   dplyr::mutate(
-    dplyr::across(
+    across(
       .cols = c(Cough, Myalgia, Weakness),
       .fns = ~factor(.x,
                      levels = c("None", "Mild", "Moderate", "Severe"),
                      ordered = TRUE)
     )
-  )
-
-# Next, we will remove any binary variables with < 50 events. These variables
-# are unlikely to be predictive.
-dat <- dat |>
+  ) |>
+  # Remove binary variables with < 50 events
   dplyr::select(
     # Select all variables with at least 50 yes
     where(~sum(.x == "Yes") >= 50),
@@ -61,38 +63,88 @@ dat <- dat |>
     where(~all(levels(.x) != c("No", "Yes")))
   )
 
-###############################
+dplyr::glimpse(dat)
+```
+
 # Modeling setup
-###############################
+
+Before we begin modeling, we will split the data into testing and training sets. We will also resample the testing set using CV. We will use 70% of data as the training data and 30% as testing, stratifying by the outcome variable (BodyTemp). Additionally, we will resample the training data using 5-fold cross validation, 5 times repeated. The CV folds will also be stratified on body temperature.
+
+```{r SplitResample}
+# Set see to ensure reproducibility
 set.seed(123)
 
-# Before we begin modeling, we will split the data into testing and training
-# sets. We will also resample the testing set using CV.
+# Splitting and resampling data
 dat_split <- rsample::initial_split(dat, prop = .7, strata = BodyTemp)
 train <- rsample::training(dat_split)
 test <- rsample::testing(dat_split)
 resamples <- rsample::vfold_cv(train, v = 5, repeats = 5, strata = BodyTemp)
+```
 
-# Now we will create a recipe for fitting the models.
+Next we will define recipes to further preprocess the data. This will ensure that all of the data are in the correct form for the models we want to use. Primarily we need to ensure that the categorical and ordinal variables in the data are converted to numerical variables which can be used for linear algebra and that kind of stuff. For the binary variables, they just need to be converted into a dummy variable for "Yes". The ordinal variables are a bit more tricky. I will implement three recipes for the ordinal variables:
+1. Coding the ordinal variables as integers using a linear increase. So for our ordinal variables with 4 levels, they will be recoded to 1, 2, 3, 4. This assumes a linear increase between each level of the ordinal variable. We could also experiment with other coding schemes (e.g. 0, 1, 2, 3; or 0, 1, 2, 4; or 0, 1, 4, 16; etc.) but I am not going to. Messing around with the codes feels a bit hacky to me when really I only want to assume a monotonic effect.
+2. Treating the ordinal variables just as unordered factors. This makes no assumption between the effect of each level.
+3. Coding the ordinal variables using orthogonal polynomial contrasts. Since our ordinal variables have four levels, we can get cubic contrasts. This allows each of the ordinal variables to have a linear effect, a quadratic effect, and a cubic effect, instead of just a linear effect as in the first coding scheme.
+
+For fitting the models, I am only going to use the orthongonal polynomials, as all of the models we are fitting can handle variable selection automatically. So we might as well include as much information that could be useful as possible. If I have time later, I will compare these strategies.
+
+```{r Recipes}
+# Coding as linear trend using step_ordinalscore()
 bt_rec_int <- recipe(BodyTemp ~ ., data = train) |>
   step_ordinalscore(Cough, Weakness, Myalgia) |>
   step_dummy(all_nominal_predictors())
 
+# Coding as orthogonal polynomial contrasts -- the default for ordinals
 bt_rec_pol <- recipe(BodyTemp ~ ., data = train) |>
   step_dummy(all_nominal_predictors())
 
+# Convert ordinals to unordered factors and then dummy code
 bt_rec_fac <- recipe(BodyTemp ~ ., data = train) |>
   step_mutate(across(c(Cough, Weakness, Myalgia), as.factor)) |>
   step_dummy(all_nominal_predictors())
+```
 
+Next we will define the model specifications we want to use. For the decision tree and random forest models, I will tune all necessary parameters. For the LASSO model, we only need to tune the penalty.
+
+```{r ModelSpecs}
+# Spec for single decision tree model
+tree_spec <-
+  decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune(),
+    min_n = tune()
+  ) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+# Spec for LASSO model--setting mixture = 1 makes this LASSO instead of ridge
+lasso_spec <-
+  linear_reg(
+    penalty = tune(),
+    mixture = 1
+  ) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# Spec for random forest model
+rf_spec <-
+  rand_forest(
+    mtry = tune(),
+    min_n = tune(),
+    trees = tune()
+  ) |>
+  set_engine("ranger", num.threads = 8) |>
+  set_mode("regression")
+```
+
+Now we need to establish a metric for tuning. Since these are regression models, I will use the RMSE to tune all models. So I will define a metric set function, and I will also calculate the RMSE (and a quick and dirty bootstrap SE) assuming the null model where all values are predicted by the mean of the observed values, i.e.
+
+$$\hat{y}_i = \bar{y} \ \forall i.$$
+```{r Metrics}
 # Define a metric set so we can tune on RMSE only.
 bt_met <- metric_set(rmse)
 
-###############################
-# Getting null RMSE
-###############################
-
-# I am going to estimate the null RMSE and get the SE by bootstraps.
+# Calculate the null RMSE
 res <- numeric(1000)
 for (i in 1:1000) {
   Bi <- train[sample(1:nrow(train), size = nrow(train), replace = TRUE), "BodyTemp"]
@@ -106,50 +158,41 @@ null_rmse <- tibble(
   std_err = sd(res)
 )
 
-###############################
-# Model specs
-###############################
-tree_spec <- decision_tree(
-  cost_complexity = tune(),
-  tree_depth = tune(),
-  min_n = tune()
-) |>
-  set_engine("rpart") |>
-  set_mode("regression")
+null_rmse |>
+  dplyr::mutate(across(everything(), ~round(.x, digits = 2))) |>
+  knitr::kable(caption = "RMSE and boostrap SE (B = 1000) for the null model.")
+```
 
-lasso_spec <- linear_reg(penalty = tune(), mixture = 1) |>
-  set_engine("glmnet") |>
-  set_mode("regression")
+Now we can get started fitting the models.
 
-rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = tune()) |>
-  set_engine("ranger", num.threads = 8) |>
-  set_mode("regression")
+# Model fitting
 
-###############################
-# Regression tree model
-###############################
+The first model I will fit will be a simple regression tree.
 
-# For the regression tree model, I am going to code the ordinal predictors as
-# polynomial contrasts. Since all three of the models we are using have some
-# form of variable selection, I think using orthogonal polynomials makes the
-# most sense, because if the terms are irrelevant, they can be discarded.
+## Regression tree model
 
-# Create workflow
-tree_wf_pol <- workflow() |>
+First we will define a workflow which combines the model specification with the preprocessor.
+
+```{r TreeWF}
+tree_wf <- workflow() |>
   add_model(tree_spec) |>
   add_recipe(bt_rec_pol)
+```
 
-# For tuning, I was worried about running into a local minimum and not covering
-# any better parameter values. So I started with a small grid search and used
-# that as the initial parameter guess for simulated annealing.
+I am going to use a bit of an in-depth tuning strategy here: first I will use Latin hypercube sampling to get a grid of potential parameter estimates that covers the space of potential parameter values pretty well. Then, I will use the optimum value from this grid search as the initial value for simulated annealing. The optimal parameter results from simulated annealing will be used for fitting the model.
 
-doParallel::registerDoParallel(cores = 12)
+```{r TreeTuning, cache = TRUE}
+# Register a parallel backend so this doesn't take all day
+doParallel::registerDoParallel(cores = 16)
 
+# Define a grid of potential parameter values using latin hypercube sampling. I
+# allowed the dials package to choose the range of the parameters to guess.
 tree_grid <- grid_latin_hypercube(
   cost_complexity(), tree_depth(), min_n(), size = 100
 )
 
-tree_pol_grid <- tree_wf_pol |>
+# Grid search for parameter values
+tree_grid_res <- tree_wf |>
   tune_grid(
     resamples = resamples,
     metrics = bt_met,
@@ -157,37 +200,58 @@ tree_pol_grid <- tree_wf_pol |>
     grid = tree_grid
   )
 
-tree_pol_sa <- tree_wf_pol %>%
+# Use the grid search to initialize simulated annealing.
+tree_sa <- tree_wf %>%
   tune_sim_anneal(
     resamples = resamples,
     metrics = bt_met,
     control = control_sim_anneal(verbose = TRUE),
     iter = 100,
-    initial = tree_pol_grid
+    initial = tree_grid_res
   )
 
+# Turn off the parallel cluster--it gets weird if you don't!
 doParallel::stopImplicitCluster()
 
 # Select best parameter values after optimization
-best_tree_pol <- select_best(tree_pol_sa)
+best_tree_sa <- select_best(tree_sa)
 
 # Finalize workflow with best values
-final_tree_wf_pol <- tree_wf_pol |>
-  finalize_workflow(best_tree_pol)
+final_tree_wf <- tree_wf |>
+  finalize_workflow(best_tree_sa)
 
 # Fit model to training data
-tree_pol_fit <- final_tree_wf_pol |> fit(data = train)
+tree_train_fit <- final_tree_wf |> fit(data = train)
+```
 
+Now that the final model is fitted, we can explore the results of fitting on the training data. First, let's plot the final tree.
+
+```{r TreePlot}
 # Get a plot of the fitted tree
-rpart.plot::rpart.plot(tree_pol_fit$fit$fit$fit)
+png(filename = here::here("results", "figures", "tree_diagram.png"))
+rpart.plot::rpart.plot(
+  x = extract_fit_parsnip(tree_train_fit)$fit,
+  roundint = F,
+  type = 5,
+  digits = 4,
+  main = "Final tree model after tuning"
+)
+dev.off()
+knitr::include_graphics( here::here("results", "figures", "tree_diagram.png"))
+```
 
-# Plot model predictions vs actual outcomes
-tree_pol_res <- tree_pol_fit |>
+Next, we will plot the predicted values vs. the actual outcomes, along with the predicted values vs. the residuals. This can help us understand how well the model is performing, and what deviations it may be making.
+
+```{r TreeDiagnosticPlots}
+# Get predictions and residuals
+tree_res <- tree_train_fit |>
   augment(new_data = train) |>
-  select(.pred, BodyTemp) |>
+  dplyr::select(.pred, BodyTemp) |>
   dplyr::mutate(.resid = BodyTemp - .pred)
 
-tree_pred_obs_plot <- ggplot(tree_pol_res, aes(x = BodyTemp, y = .pred)) +
+# Plot Predictions vs observed values
+tree_pred_obs_plot <- ggplot(tree_res, aes(x = BodyTemp, y = .pred)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", lty = 2) +
   geom_point() +
   cowplot::theme_cowplot() +
   labs(
@@ -197,49 +261,204 @@ tree_pred_obs_plot <- ggplot(tree_pol_res, aes(x = BodyTemp, y = .pred)) +
   )
 
 # Plot model predictions vs residuals
-tree_pred_res_plot <- ggplot(tree_pol_res, aes(x = .resid, y = .pred)) +
+tree_pred_res_plot <- ggplot(tree_res, aes(y = .resid, x = .pred)) +
+  geom_hline(yintercept = 0, color = "red", lty = 2) +
   geom_point() +
   cowplot::theme_cowplot() +
   labs(
-    title = "Decision tree: predicted vs residuals",
-    x = "Residuals",
+    title = "Decision tree: residuals vs fitted",
+    y = "Residuals",
+    x = "Fitted"
+  )
+
+# Print both plots together
+tree_diag <- cowplot::plot_grid(
+  tree_pred_obs_plot, tree_pred_res_plot, ncol = 1
+)
+tree_diag
+ggsave(filename = here::here("results", "figures", "tree_diagnostics.png"),
+       plot = tree_diag,
+       width = 11, height = 8.5)
+```
+
+Wow! From this plot, we can see that our decision tree is only predicting four distinct values. That isn't very good at all. Let's check the parameters and RMSEs of the best perfoming models.
+
+```{r BestTrees}
+tree_sa |>
+  show_best(n = 10)  |>
+  dplyr::select(rmse = mean, std_err, cost_complexity, tree_depth, min_n) |>
+  dplyr::mutate(
+    rmse = round(rmse, 2),
+    std_err = round(std_err, 2),
+    cost_complexity = scales::scientific(cost_complexity)
+  ) |>
+  knitr::kable(caption = "Best performing hyperparameter sets")
+```
+
+Now we can compare the performance of the tree model we selected as the best with the null model.
+
+```{r TreeRMSE}
+tree_RMSE <- tree_sa |>
+  show_best(n = 1) |>
+  dplyr::select(estimate = mean, std_err) |>
+  dplyr::bind_rows(null_rmse) |>
+  dplyr::mutate(
+    model = c("Tree", "Null"),
+    rmse = round(estimate, 2),
+    SE = round(std_err, 4),
+    .keep = "unused"
+  )
+tree_RMSE |>
+  knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
+```
+
+Our tree is somewhat better than the null model, but not exceptionally so. It is difficult to judge how big of a discrepancy this is before fitting additional models, though.
+
+Now let's move on to the LASSO model.
+
+## LASSO regression model
+
+First, I will set up a workflow for the LASSO model. Again, I'm going to code the ordinal variables using orthogonal polynomial contrasts.
+
+```{r LassoWF}
+lasso_wf <- workflow() |>
+  add_model(lasso_spec) |>
+  add_recipe(bt_rec_pol)
+```
+
+For LASSO, we likely don't need to do as in-depth of a tuning routine, but for the sake of consistency, I'll still tune the penalty parameter in two stages. I'll use a normal grid search for the first stage (there is no real need to use latin hypercube sampling when we are only tuning one parameter), and then use that as the initial guess for simulated annealing. Hopefully this model will work better than the tree.
+
+```{r LassoTuning, cache = TRUE}
+# Register a parallel backend so this doesn't take all day
+doParallel::registerDoParallel(cores = 16)
+
+# Define a grid of potential parameter values. I again allowed dials to choose
+# the range of parameters to search for the penalty parameter.
+lasso_grid <- grid_regular(penalty(), levels = 100)
+
+# Grid search for parameter values
+lasso_grid_res <- lasso_wf |>
+  tune_grid(
+    resamples = resamples,
+    metrics = bt_met,
+    control = control_grid(verbose = TRUE),
+    grid = lasso_grid
+  )
+
+# Use the grid search to initialize simulated annealing.
+lasso_sa <- lasso_wf %>%
+  tune_sim_anneal(
+    resamples = resamples,
+    metrics = bt_met,
+    control = control_sim_anneal(verbose = TRUE),
+    iter = 100,
+    initial = lasso_grid_res
+  )
+
+# Turn off the parallel cluster--it gets weird if you don't!
+doParallel::stopImplicitCluster()
+
+# Select best parameter values after optimization
+best_lasso_sa <- select_best(lasso_sa)
+
+# Finalize workflow with best values
+final_lasso_wf <- lasso_wf |>
+  finalize_workflow(best_lasso_sa)
+
+# Fit model to training data
+lasso_train_fit <- final_lasso_wf |> fit(data = train)
+```
+
+We can't plot the actual model here, but we can make the trace plot for the coefficients, so let's do that.
+
+```{r LassoTracePlots}
+# Extract glmnet object from workflow
+x <- lasso_train_fit$fit$fit$fit
+
+# Plot trace plot
+png(filename = here::here("results", "figures", "lasso_trace.png"))
+plot(x, "lambda")
+dev.off()
+knitr::include_graphics(here::here("results", "figures", "lasso_trace.png"))
+```
+
+This is exactly what we should expect--as the penalty increase, more terms drop out of the model. There is nothing really unusual or noteworthy here.
+
+Next, let's plot the diagnostic plots (same as before) for the LASSO model.
+
+```{r LassoDiagnosticPlots}
+# Get predictions and residuals
+lasso_res <- lasso_train_fit |>
+  augment(new_data = train) |>
+  dplyr::select(.pred, BodyTemp) |>
+  dplyr::mutate(.resid = BodyTemp - .pred)
+
+# Plot Predictions vs observed values
+lasso_pred_obs_plot <- ggplot(lasso_res, aes(x = BodyTemp, y = .pred)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: predicted vs observed",
+    x = "Observed",
     y = "Fitted"
   )
 
-# Get best outcomes
-tree
+# Plot model predictions vs residuals
+lasso_pred_res_plot <- ggplot(lasso_res, aes(y = .resid, x = .pred)) +
+  geom_hline(yintercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: residuals vs fitted",
+    y = "Residuals",
+    x = "Fitted"
+  )
 
-# Compare to null model RMSE
-
-###
-# put tree plots together
-###
-
-cowplot::plot_grid(
-  facp1, intp1, polp1, facp2, intp2, polp2, ncol = 3, nrow = 2
+# Print both plots together
+lasso_diag <- cowplot::plot_grid(
+  lasso_pred_obs_plot, lasso_pred_res_plot, ncol = 1
 )
-
-
-# tree_wf <- workflow_set(
-#   preproc = list(
-#     "unconstrained" = bt_rec_fac,
-#     "linear" = bt_rec_int,
-#     "polynomial" = bt_rec_pol
-#   ),
-#   models = list("tree" = tree_spec)
-# )
-# 
-# this <- workflow_map(
-#   tree_wf,
-#   fn = "tune_grid",
-#   verbose = TRUE,
-#   seed = 123,
-#   resamples = resamples,
-#   metrics = bt_met,
-#   grid = tree_grid,
-#   control = control_grid(verbose = TRUE)
-# )
-
-
+lasso_diag
+ggsave(filename = here::here("results", "figures", "lasso_diagnostics.png"),
+       plot = lasso_diag,
+       width = 11, height = 8.5)
 ```
 
+Well, the LASSO model appears to be performing better than the decision tree at least. But there are some noticeable problems. From the plot of predicted vs observed values, we can see that LASSO is not predicting some of the most extreme values at well, which is problematic and will definitely hurt the prediction accuracy. The residual plot also suggests that the LASSO model is biased towards lower values. It could also indicate heteroscedasticity of the residuals, but we don't need to worry about that right now.
+
+Let's example the best penalty values and see what the RMSEs look like.
+
+```{r BestLASSO}
+lasso_sa |>
+  show_best(n = 10)  |>
+  dplyr::select(rmse = mean, std_err, penalty) |>
+  dplyr::mutate(
+    rmse = round(rmse, 2),
+    std_err = round(std_err, 4),
+    `log penalty` = round(log(penalty), 2),
+    .keep = "unused"
+  ) |>
+  knitr::kable(caption = "Best performing hyperparameter sets")
+```
+
+Now we can compare the performance of the LASSO model we selected as the best with the null model (and the tree model).
+
+```{r LassoRMSE}
+lasso_RMSE <- lasso_sa |>
+  show_best(n = 1) |>
+  dplyr::transmute(
+    rmse = round(mean, 2),
+    SE = round(std_err, 4),
+    model = "LASSO"
+  ) |>
+  dplyr::bind_rows(tree_RMSE)
+lasso_RMSE |>
+  knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
+```
+
+Well, the LASSO model is a bit better than the tree model, but not really. It looks like the tree model only guessing four different values didn't perform a lot better than LASSO. This might indicate that our predictors are not very strongly associated with the outcome.
+
+Either way, let's go ahead and fit the random forest model and see if that is any better.
+
+## Random forest model
