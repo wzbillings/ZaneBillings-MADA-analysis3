@@ -8,7 +8,7 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
 ```
 
 # Setup
@@ -34,6 +34,12 @@ library(ranger)
 
 # Load the data
 dat_orig <- readRDS(here::here("data", "processed_data", "processeddata.rds"))
+
+# Fixes weird doParallel errors
+unregister_dopar <- function() {
+     env <- foreach:::.foreachGlobals
+     rm(list=ls(name=env), pos=env)
+}
 ```
 
 # Data Preprocessing
@@ -183,7 +189,7 @@ I am going to use a bit of an in-depth tuning strategy here: first I will use La
 
 ```{r TreeTuning, cache = TRUE}
 # Register a parallel backend so this doesn't take all day
-doParallel::registerDoParallel(cores = 16)
+doParallel::registerDoParallel()
 
 # Define a grid of potential parameter values using latin hypercube sampling. I
 # allowed the dials package to choose the range of the parameters to guess.
@@ -205,13 +211,14 @@ tree_sa <- tree_wf %>%
   tune_sim_anneal(
     resamples = resamples,
     metrics = bt_met,
-    control = control_sim_anneal(verbose = TRUE),
+    control = control_sim_anneal(verbose = TRUE, no_improve = 10),
     iter = 100,
     initial = tree_grid_res
   )
 
 # Turn off the parallel cluster--it gets weird if you don't!
 doParallel::stopImplicitCluster()
+unregister_dopar()
 
 # Select best parameter values after optimization
 best_tree_sa <- select_best(tree_sa)
@@ -330,7 +337,7 @@ For LASSO, we likely don't need to do as in-depth of a tuning routine, but for t
 
 ```{r LassoTuning, cache = TRUE}
 # Register a parallel backend so this doesn't take all day
-doParallel::registerDoParallel(cores = 16)
+doParallel::registerDoParallel()
 
 # Define a grid of potential parameter values. I again allowed dials to choose
 # the range of parameters to search for the penalty parameter.
@@ -350,13 +357,14 @@ lasso_sa <- lasso_wf %>%
   tune_sim_anneal(
     resamples = resamples,
     metrics = bt_met,
-    control = control_sim_anneal(verbose = TRUE),
+    control = control_sim_anneal(verbose = TRUE, no_improve = 10),
     iter = 100,
     initial = lasso_grid_res
   )
 
 # Turn off the parallel cluster--it gets weird if you don't!
 doParallel::stopImplicitCluster()
+unregister_dopar()
 
 # Select best parameter values after optimization
 best_lasso_sa <- select_best(lasso_sa)
@@ -475,7 +483,7 @@ For the random forest, I'll skip the initial grid search and just let the simula
 
 ```{r RFTuning, cache = TRUE}
 # Register a parallel backend so this doesn't take all day
-doParallel::registerDoParallel(cores = 16)
+doParallel::registerDoParallel()
 
 # Since the potential values of mtry depend on the data, we need to finalize
 # the parameters before optimizing.
@@ -485,8 +493,9 @@ rf_parms <- rf_spec |>
 
 # Simulated annealing for parameter optimization. The simulated annealing
 # algorithm will run for a max of 250 iterations, but stop if it does not
-# improve in 10 consecutive runs. I've also lowered the cooling coefficient
-# a bit and increased the neighborhood to search.
+# improve in 10 consecutive iterations I've also lowered the cooling coefficient
+# a bit and changed the neighborhood to search (radius parameter) to have a 
+# lower minimum and higher maximum.
 rf_sa <- rf_wf %>%
   tune_sim_anneal(
     resamples = resamples,
@@ -503,6 +512,7 @@ rf_sa <- rf_wf %>%
 
 # Turn off the parallel cluster--it gets weird if you don't!
 doParallel::stopImplicitCluster()
+unregister_dopar()
 
 # Select best parameter values after optimization
 best_rf_sa <- select_best(rf_sa)
@@ -600,11 +610,79 @@ rf_RMSE <- rf_sa |>
   ) |>
   dplyr::bind_rows(lasso_RMSE)
 rf_RMSE |>
-  knitr::kable(caption = "Comparison of RMSE values for the regression tree vs. the null model.")
+  knitr::kable(caption = "Comparison of RMSE values for the models.")
 ```
 
 # Model selection and evaluation
 
-For the final step of this analysis, we need to choose one of the models. {EXPLAIN HERE}
+For the final step of this analysis, we need to choose one of the models. i'm going to choose the LASSO model for the final fit for a few reasons, which I will enumerate now.
+1. Linear models are the best models.
+2. The RMSE for LASSO was slightly lower using the tuning settings and seed that I did (if you ignore the standard errors anyways).
+3. The LASSO model is much simpler than a random forest model, and less prone to overfitting than a decision tree (though I doubt that will matter much for this model).
 
 Now I will fit this model on the testing set to evaluate the out-of-sample performance.
+```{r TestFit}
+lasso_test_fit <- final_lasso_wf |>
+  last_fit(split = dat_split, metrics = bt_met)
+```
+
+Let's examine the testing performance compared to the model performance on the training data.
+
+```{r}
+lasso_test_rmse <- collect_metrics(lasso_test_fit) |>
+  dplyr::select(rmse = .estimate) |>
+  dplyr::mutate(data = "testing")
+
+lasso_RMSE |>
+  dplyr::filter(model == "LASSO") |>
+  dplyr::transmute(
+    rmse, data = "training"
+  ) |>
+  bind_rows(lasso_test_rmse) |>
+  gt::gt(caption = "Comparison of RMSE for LASSO between training and testing data.")
+```
+
+Let's also examine the diagnostic plots.
+
+```{r LassoTestDiagnosticPlots}
+# Get predictions and residuals
+lasso_test_res <- lasso_test_fit |>
+  augment() |>
+  dplyr::select(.pred, BodyTemp) |>
+  dplyr::mutate(.resid = BodyTemp - .pred)
+
+# Plot Predictions vs observed values
+lasso_test_pred_obs_plot <- ggplot(lasso_test_res, aes(x = BodyTemp, y = .pred)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: predicted vs observed (test data)",
+    x = "Observed",
+    y = "Fitted"
+  )
+
+# Plot model predictions vs residuals
+lasso_test_pred_res_plot <- ggplot(lasso_test_res, aes(y = .resid, x = .pred)) +
+  geom_hline(yintercept = 0, color = "red", lty = 2) +
+  geom_point() +
+  cowplot::theme_cowplot() +
+  labs(
+    title = "LASSO: residuals vs fitted (test data)",
+    y = "Residuals",
+    x = "Fitted"
+  )
+
+# Print both plots together
+lasso_test_diag <- cowplot::plot_grid(
+  lasso_test_pred_obs_plot, lasso_test_pred_res_plot, ncol = 1
+)
+lasso_test_diag
+ggsave(filename = here::here("results", "figures", "lasso_test_diagnostics.png"),
+       plot = lasso_test_diag,
+       width = 11, height = 8.5)
+```
+
+Well, surprinsing no one, we see the same problem on the test data. Fortunately, the RMSE did not drop too much, indicating that overfitting is not a huge problem. The main problem is the lack of fit in the first place. We are simply not capturing the trend in the data very well.
+
+That's all for now about these models--we did not find a very good fit, but this did help us learn a bit more about the data. Particularly, now we know that addressing the skew in the outcome variable of body temperature may be important, or it may be that our data simply aren't very predictive for body temperature.
